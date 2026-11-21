@@ -1456,6 +1456,18 @@ class H2Connection:
         if SettingCodes.HEADER_TABLE_SIZE in changes:
             setting = changes[SettingCodes.HEADER_TABLE_SIZE]
             self.encoder.header_table_size = setting.new_value
+            # The hpack encoder only emits a queued dynamic table size update
+            # while its header table is flagged as resized. Setting the same
+            # size twice in a row (e.g. two SETTINGS frames both carrying 0)
+            # clears that flag even though an earlier size change is still
+            # queued. The update would then never be signalled to the peer,
+            # whose decoder would keep the old table state while our encoder
+            # has already resized its own, desynchronising the two tables.
+            # Re-arm the flag whenever a change is pending so the next header
+            # block always carries the update at its start, as required by
+            # RFC 7541 Section 4.2.
+            if self.encoder.table_size_changes:
+                self.encoder.header_table.resized = True
 
         if SettingCodes.MAX_FRAME_SIZE in changes:
             setting = changes[SettingCodes.MAX_FRAME_SIZE]

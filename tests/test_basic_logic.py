@@ -1558,6 +1558,94 @@ class TestBasicServer:
 
         assert c.decoder.header_table_size == 4096
 
+    def test_repeated_remote_header_table_size_change_is_signalled(
+        self, frame_factory,
+    ) -> None:
+        """
+        A HEADER_TABLE_SIZE change that is repeated (so the encoder no longer
+        marks its table as resized) must still be signalled to the peer in the
+        next header block when an earlier change is pending.
+        """
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.receive_data(frame_factory.preamble())
+
+        settings_frame = frame_factory.build_settings_frame(
+            {h2.settings.SettingCodes.HEADER_TABLE_SIZE: 0},
+        )
+        c.receive_data(settings_frame.serialize())
+        c.clear_outbound_data_buffer()
+
+        # A second SETTINGS frame carrying the same value clears the encoder's
+        # resized flag while the first size change is still queued.
+        c.receive_data(settings_frame.serialize())
+        c.clear_outbound_data_buffer()
+
+        assert c.encoder.header_table_size == 0
+        assert c.encoder.table_size_changes == [0]
+
+        encoded = c.encoder.encode(self.example_response_headers)
+
+        # The first byte of the header block is the dynamic table size update
+        # to 0: 0x20 with a 5-bit prefix integer.
+        assert encoded[0] == 0x20
+        assert not c.encoder.table_size_changes
+
+    def test_encoder_table_stays_synchronised_after_table_size_reset(
+        self, frame_factory,
+    ) -> None:
+        """
+        After the peer shrinks HEADER_TABLE_SIZE to 0, including via repeated
+        or oscillating SETTINGS frames, the encoder and the peer decoder must
+        keep identical dynamic tables for every subsequent header block, so no
+        stream references an index the peer has evicted.
+        """
+        client_config = h2.config.H2Configuration(
+            client_side=True, header_encoding="utf-8",
+        )
+        server_config = h2.config.H2Configuration(
+            client_side=False, header_encoding="utf-8",
+        )
+        client = h2.connection.H2Connection(config=client_config)
+        server = h2.connection.H2Connection(config=server_config)
+
+        client.initiate_connection()
+        server.receive_data(client.data_to_send())
+        client.receive_data(server.data_to_send())
+
+        request_headers = [
+            *self.example_request_headers,
+            ("x-custom-header", "value" * 20),
+        ]
+
+        # Populate the dynamic tables on both sides first.
+        client.send_headers(1, request_headers)
+        server.receive_data(client.data_to_send())
+        assert len(client.encoder.header_table.dynamic_entries) > 0
+
+        for new_size in (0, 4096, 0, 0):
+            settings_frame = frame_factory.build_settings_frame(
+                {h2.settings.SettingCodes.HEADER_TABLE_SIZE: new_size},
+            )
+            client.receive_data(settings_frame.serialize())
+            client.clear_outbound_data_buffer()
+
+        for stream_id in (3, 5, 7, 9):
+            client.send_headers(stream_id, request_headers)
+            events = server.receive_data(client.data_to_send())
+            assert any(
+                isinstance(event, h2.events.RequestReceived)
+                for event in events
+            )
+
+        assert (
+            client.encoder.header_table.maxsize
+            == server.decoder.header_table.maxsize
+        )
+        assert (
+            list(client.encoder.header_table.dynamic_entries)
+            == list(server.decoder.header_table.dynamic_entries)
+        )
+
     def test_restricting_outbound_frame_size_by_settings(self, frame_factory) -> None:
         """
         The remote peer can shrink the maximum outbound frame size using

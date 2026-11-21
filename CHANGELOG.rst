@@ -14,7 +14,10 @@ dev
 
 **Bugfixes**
 
--
+- Ensure a queued HPACK dynamic table size update is always emitted in the
+  next header block when repeated ``SETTINGS_HEADER_TABLE_SIZE`` changes clear
+  the encoder's resized flag, preventing encoder/decoder table
+  desynchronisation and the resulting connection reset.
 
 4.4.1 (2026-08-03)
 ------------------
