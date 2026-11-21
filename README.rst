@@ -36,10 +36,11 @@ You use it like this:
     socket.sendall(conn.data_to_send())
     events = conn.receive_data(socket_data)
 
-This repository does not provide a parsing layer, a network layer, or any rules
-about concurrency. Instead, it's a purely in-memory solution, defined in terms
-of data actions and HTTP/2 frames. This is one building block of a full Python
-HTTP implementation.
+This repository does not provide a parsing layer, a network layer, or an event
+loop. Instead, it's a purely in-memory solution, defined in terms of data
+actions and HTTP/2 frames. This is one building block of a full Python HTTP
+implementation. Outbound streams that exceed the peer's advertised concurrent
+stream limit are queued until capacity becomes available.
 
 To install it, just run:
 

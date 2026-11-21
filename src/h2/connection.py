@@ -7,6 +7,8 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+from collections import deque
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -106,6 +108,22 @@ class ConnectionInputs(Enum):
 class AllowedStreamIDs(IntEnum):
     EVEN = 0
     ODD = 1
+
+
+@dataclass
+class _QueuedStream:
+    """
+    An outbound stream waiting for concurrent-stream capacity.
+    """
+
+    stream: H2Stream
+    headers: tuple[HeaderWeaklyTyped, ...]
+    end_stream: bool
+    priority_weight: int | None
+    priority_depends_on: int | None
+    priority_exclusive: bool | None
+    data: list[tuple[bytes | memoryview, bool, int | None]] = field(default_factory=list)
+    queued_data_size: int = 0
 
 
 class H2ConnectionStateMachine:
@@ -325,6 +343,9 @@ class H2Connection:
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
+        self._queued_streams: deque[_QueuedStream] = deque()
+        self._queued_streams_by_id: dict[int, _QueuedStream] = {}
+        self._draining_outbound_streams = False
         self.highest_inbound_stream_id = 0
         self.highest_outbound_stream_id = 0
         self.encoder = Encoder()
@@ -459,6 +480,34 @@ class H2Connection:
         """
         inbound_numbers = int(not self.config.client_side)
         return self._open_streams(inbound_numbers)
+
+    @property
+    def pending_outbound_streams(self) -> int:
+        """
+        The number of outbound streams waiting for concurrent-stream capacity.
+        """
+        return len(self._queued_streams)
+
+    @property
+    def queued_outbound_streams(self) -> int:
+        """
+        The number of outbound streams waiting for concurrent-stream capacity.
+        """
+        return len(self._queued_streams)
+
+    @property
+    def pending_outbound_stream_ids(self) -> tuple[int, ...]:
+        """
+        The stream IDs waiting for concurrent-stream capacity, in queue order.
+        """
+        return tuple(queued.stream.stream_id for queued in self._queued_streams)
+
+    @property
+    def queued_outbound_stream_ids(self) -> tuple[int, ...]:
+        """
+        The stream IDs waiting for concurrent-stream capacity, in queue order.
+        """
+        return tuple(queued.stream.stream_id for queued in self._queued_streams)
 
     @property
     def inbound_flow_control_window(self) -> int:
@@ -684,6 +733,129 @@ class H2Connection:
 
         return next_stream_id
 
+    def _has_outbound_stream_capacity(self) -> bool:
+        """
+        Whether a new outbound stream may be admitted right now.
+        """
+        return self.open_outbound_streams < self.remote_settings.max_concurrent_streams
+
+    def _queue_headers(self,
+                       stream_id: int,
+                       headers: Iterable[HeaderWeaklyTyped],
+                       end_stream: bool,
+                       priority_weight: int | None,
+                       priority_depends_on: int | None,
+                       priority_exclusive: bool | None) -> None:
+        """
+        Reserve a stream ID and place its HEADERS block at the back of the
+        admission queue.
+        """
+        queued_headers = tuple(headers)
+        stream = self._begin_new_stream(
+            stream_id, AllowedStreamIDs(self.config.client_side),
+        )
+        queued = _QueuedStream(
+            stream=stream,
+            headers=queued_headers,
+            end_stream=end_stream,
+            priority_weight=priority_weight,
+            priority_depends_on=priority_depends_on,
+            priority_exclusive=priority_exclusive,
+        )
+        self._queued_streams.append(queued)
+        self._queued_streams_by_id[stream_id] = queued
+        self.config.logger.debug(
+            "Queued stream ID %d behind %d pending streams",
+            stream_id, len(self._queued_streams) - 1,
+        )
+
+    def _send_headers_now(self,
+                          stream_id: int,
+                          headers: Iterable[HeaderWeaklyTyped],
+                          end_stream: bool,
+                          priority_weight: int | None,
+                          priority_depends_on: int | None,
+                          priority_exclusive: bool | None) -> None:
+        """
+        Send a HEADERS block immediately.
+        """
+        self.state_machine.process_input(ConnectionInputs.SEND_HEADERS)
+        stream = self._get_or_create_stream(
+            stream_id, AllowedStreamIDs(self.config.client_side),
+        )
+
+        frames: list[Frame] = []
+        frames.extend(stream.send_headers(
+            headers, self.encoder, end_stream,
+        ))
+
+        # We may need to send priority information.
+        priority_present = (
+            (priority_weight is not None) or
+            (priority_depends_on is not None) or
+            (priority_exclusive is not None)
+        )
+
+        if priority_present:
+            if not self.config.client_side:
+                msg = "Servers SHOULD NOT prioritize streams."
+                raise RFC1122Error(msg)
+
+            headers_frame = frames[0]
+            assert isinstance(headers_frame, HeadersFrame)
+
+            headers_frame.flags.add("PRIORITY")
+            frames[0] = _add_frame_priority(
+                headers_frame,
+                priority_weight,
+                priority_depends_on,
+                priority_exclusive,
+            )
+
+        self._prepare_for_sending(frames)
+
+    def _admit_queued_streams(self) -> None:
+        """
+        Admit queued outbound streams in FIFO order while capacity allows.
+        """
+        if self._draining_outbound_streams:
+            return
+
+        self._draining_outbound_streams = True
+        try:
+            while self._queued_streams and self._has_outbound_stream_capacity():
+                queued = self._queued_streams.popleft()
+                del self._queued_streams_by_id[queued.stream.stream_id]
+
+                self._send_headers_now(
+                    queued.stream.stream_id,
+                    queued.headers,
+                    queued.end_stream,
+                    queued.priority_weight,
+                    queued.priority_depends_on,
+                    queued.priority_exclusive,
+                )
+
+                for data, end_stream, pad_length in queued.data:
+                    self.send_data(
+                        queued.stream.stream_id,
+                        data,
+                        end_stream=end_stream,
+                        pad_length=pad_length,
+                    )
+        finally:
+            self._draining_outbound_streams = False
+
+    def _cancel_queued_stream(self, queued: _QueuedStream) -> None:
+        """
+        Remove a queued stream without putting anything on the wire.
+        """
+        stream_id = queued.stream.stream_id
+        del self._queued_streams_by_id[stream_id]
+        self._queued_streams.remove(queued)
+        self.streams.pop(stream_id, None)
+        self._closed_streams[stream_id] = StreamClosedBy.SEND_RST_STREAM
+
     def send_headers(self,
                      stream_id: int,
                      headers: Iterable[HeaderWeaklyTyped],
@@ -786,54 +958,47 @@ class H2Connection:
             information will be sent.
         :type priority_depends_on: ``bool`` or ``None``
 
+        If opening a new stream would exceed the peer's current
+        ``SETTINGS_MAX_CONCURRENT_STREAMS`` value, the HEADERS block is queued
+        and sent once capacity becomes available. Existing streams are not
+        affected.
+
         :returns: Nothing
         """
         self.config.logger.debug(
             "Send headers on stream ID %d", stream_id,
         )
 
-        # Check we can open the stream.
-        if stream_id not in self.streams:
-            max_open_streams = self.remote_settings.max_concurrent_streams
-            value = self.open_outbound_streams # take a copy due to the property accessor having side affects
-            if (value + 1) > max_open_streams:
-                msg = f"Max outbound streams is {max_open_streams}, {value} open"
-                raise TooManyStreamsError(msg)
+        # A stream that is still waiting for admission cannot accept another
+        # initial HEADERS block.
+        if stream_id in self._queued_streams_by_id:
+            msg = f"Stream {stream_id} is already waiting for admission"
+            raise ProtocolError(msg)
 
-        self.state_machine.process_input(ConnectionInputs.SEND_HEADERS)
-        stream = self._get_or_create_stream(
-            stream_id, AllowedStreamIDs(self.config.client_side),
-        )
-
-        frames: list[Frame] = []
-        frames.extend(stream.send_headers(
-            headers, self.encoder, end_stream,
-        ))
-
-        # We may need to send priority information.
-        priority_present = (
-            (priority_weight is not None) or
-            (priority_depends_on is not None) or
-            (priority_exclusive is not None)
-        )
-
-        if priority_present:
-            if not self.config.client_side:
-                msg = "Servers SHOULD NOT prioritize streams."
-                raise RFC1122Error(msg)
-
-            headers_frame = frames[0]
-            assert isinstance(headers_frame, HeadersFrame)
-
-            headers_frame.flags.add("PRIORITY")
-            frames[0] = _add_frame_priority(
-                headers_frame,
+        # Check whether we can open the stream. If not, reserve the ID and
+        # queue the HEADERS block instead of failing the request.
+        if (stream_id not in self.streams and
+                (self._queued_streams or not self._has_outbound_stream_capacity())):
+            self._queue_headers(
+                stream_id,
+                headers,
+                end_stream,
                 priority_weight,
                 priority_depends_on,
                 priority_exclusive,
             )
+            self._admit_queued_streams()
+            return
 
-        self._prepare_for_sending(frames)
+        self._send_headers_now(
+            stream_id,
+            headers,
+            end_stream,
+            priority_weight,
+            priority_depends_on,
+            priority_exclusive,
+        )
+        self._admit_queued_streams()
 
     def send_data(self,
                   stream_id: int,
@@ -855,6 +1020,10 @@ class H2Connection:
         h2 does this to avoid buffering the data internally. If the user
         has more data to send than h2 will allow, consider breaking it up
         and buffering it externally.
+
+        If the stream is waiting for admission because the peer's concurrent
+        stream limit has been reached, the data is buffered and sent when the
+        stream is admitted.
 
         :param stream_id: The ID of the stream on which to send the data.
         :type stream_id: ``int``
@@ -897,6 +1066,21 @@ class H2Connection:
             msg = f"Cannot send frame size {frame_size}, max frame size is {self.max_outbound_frame_size}"
             raise FrameTooLargeError(msg)
 
+        queued = self._queued_streams_by_id.get(stream_id)
+        if queued is not None:
+            if queued.end_stream or any(end for _, end, _ in queued.data):
+                raise StreamClosedError(stream_id)
+            if (frame_size and
+                    (queued.queued_data_size + frame_size) > self.local_flow_control_window(stream_id)):
+                msg = (
+                    f"Cannot queue {frame_size} bytes, flow control window is "
+                    f"{self.local_flow_control_window(stream_id)}"
+                )
+                raise FlowControlError(msg)
+            queued.data.append((data, end_stream, pad_length))
+            queued.queued_data_size += frame_size
+            return
+
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self.streams[stream_id].send_data(
             data, end_stream, pad_length=pad_length,
@@ -910,6 +1094,7 @@ class H2Connection:
             self.outbound_flow_control_window,
         )
         assert self.outbound_flow_control_window >= 0 or frame_size == 0
+        self._admit_queued_streams()
 
     def end_stream(self, stream_id: int) -> None:
         """
@@ -927,9 +1112,17 @@ class H2Connection:
             that has been closed.
         """
         self.config.logger.debug("End stream ID %d", stream_id)
+        queued = self._queued_streams_by_id.get(stream_id)
+        if queued is not None:
+            if queued.end_stream or any(end for _, end, _ in queued.data):
+                raise StreamClosedError(stream_id)
+            queued.data.append((b"", True, None))
+            return
+
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self._get_stream_by_id(stream_id).end_stream()
         self._prepare_for_sending(frames)
+        self._admit_queued_streams()
 
     def increment_flow_control_window(self, increment: int, stream_id: int | None = None) -> None:
         """
@@ -1070,10 +1263,16 @@ class H2Connection:
         :returns: Nothing
         """
         self.config.logger.debug("Reset stream ID %d", stream_id)
+        queued = self._queued_streams_by_id.get(stream_id)
+        if queued is not None:
+            self._cancel_queued_stream(queued)
+            return
+
         self.state_machine.process_input(ConnectionInputs.SEND_RST_STREAM)
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
         self._prepare_for_sending(frames)
+        self._admit_queued_streams()
 
     def close_connection(self,
                          error_code: ErrorCodes | int = 0,
@@ -1094,6 +1293,8 @@ class H2Connection:
         :returns: Nothing
         """
         self.config.logger.debug("Close connection")
+        self._queued_streams.clear()
+        self._queued_streams_by_id.clear()
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
 
         # Additional_data must be bytes
@@ -1530,6 +1731,7 @@ class H2Connection:
             self._terminate_connection(e.error_code)
             raise
 
+        self._admit_queued_streams()
         return events
 
     def _receive_frame(self, frame: Frame) -> list[Event]:
@@ -1900,6 +2102,8 @@ class H2Connection:
 
         # Clear the outbound data buffer: we cannot send further data now.
         self.clear_outbound_data_buffer()
+        self._queued_streams.clear()
+        self._queued_streams_by_id.clear()
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()

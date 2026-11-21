@@ -685,10 +685,10 @@ class TestBasicClient:
         for setting, value in new_settings.items():
             assert event.changed_settings[setting].new_value == value
 
-    def test_cannot_create_new_outbound_stream_over_limit(self, frame_factory) -> None:
+    def test_new_outbound_streams_over_limit_are_queued(self, frame_factory) -> None:
         """
         When the number of outbound streams exceeds the remote peer's
-        MAX_CONCURRENT_STREAMS setting, attempting to open new streams fails.
+        MAX_CONCURRENT_STREAMS setting, new streams wait for capacity.
         """
         c = h2.connection.H2Connection()
         c.initiate_connection()
@@ -698,10 +698,23 @@ class TestBasicClient:
         )
         c.receive_data(f.serialize())[0]
 
-        c.send_headers(1, self.example_request_headers)
+        c.send_headers(1, self.example_request_headers, end_stream=True)
+        c.clear_outbound_data_buffer()
 
-        with pytest.raises(h2.exceptions.TooManyStreamsError):
-            c.send_headers(3, self.example_request_headers)
+        c.send_headers(3, self.example_request_headers, end_stream=True)
+
+        assert c.pending_outbound_streams == 1
+        assert c.pending_outbound_stream_ids == (3,)
+        assert c.data_to_send() == b""
+
+        c.reset_stream(1)
+
+        buffer = h2.frame_buffer.FrameBuffer()
+        buffer.max_frame_size = 2**16
+        buffer.add_data(c.data_to_send())
+        frames = list(buffer)
+        assert [frame.stream_id for frame in frames] == [1, 3]
+        assert c.pending_outbound_streams == 0
 
     def test_can_receive_trailers(self, frame_factory) -> None:
         """

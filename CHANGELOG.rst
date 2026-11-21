@@ -14,7 +14,10 @@ dev
 
 **Bugfixes**
 
--
+- Outbound streams that exceed the peer's current
+  ``SETTINGS_MAX_CONCURRENT_STREAMS`` are now queued in FIFO order instead of
+  raising ``TooManyStreamsError``. Already-open streams are left untouched,
+  and queued streams are admitted as capacity becomes available.
 
 4.4.1 (2026-08-03)
 ------------------
